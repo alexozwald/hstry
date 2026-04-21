@@ -10,6 +10,7 @@ import { homedir } from 'os';
 import type {
   Adapter,
   AdapterInfo,
+  Attachment,
   Conversation,
   Message,
   ParseOptions,
@@ -238,6 +239,7 @@ function parseMessageArray(entries: unknown[]): Message[] {
       parts: textOnlyParts(content),
       createdAt,
       model: stringOrUndefined(msg.model ?? msg.model_name ?? msg.model_slug),
+      attachments: extractClaudeAttachments(msg),
     });
   }
 
@@ -306,6 +308,18 @@ function extractContent(source: unknown): string {
   }
 
   return '';
+}
+
+function extractClaudeAttachments(msg: Record<string, unknown>): Attachment[] | undefined {
+  const files = msg.files;
+  if (!Array.isArray(files) || files.length === 0) return undefined;
+  const atts: Attachment[] = [];
+  for (const f of files) {
+    if (!f || typeof f !== 'object') continue;
+    const name = (f as Record<string, unknown>).file_name;
+    if (typeof name === 'string' && name) atts.push({ type: 'file', name });
+  }
+  return atts.length > 0 ? atts : undefined;
 }
 
 function mapRole(role: string): Message['role'] {
