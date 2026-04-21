@@ -5,11 +5,13 @@
  */
 
 import { readdir, readFile, stat } from 'fs/promises';
-import { basename, join } from 'path';
+import { basename, dirname, join } from 'path';
 import { homedir } from 'os';
 import type {
   Adapter,
   AdapterInfo,
+  Attachment,
+  AttachmentType,
   Conversation,
   Message,
   ParseOptions,
@@ -40,7 +42,12 @@ interface ConversationMessage {
   update_time?: number;
   content?: {
     content_type?: string;
-    parts?: Array<string | { text?: string } | null>;
+    parts?: Array<
+      | string
+      | { text?: string }
+      | { content_type: string; asset_pointer?: string; size_bytes?: number; height?: number; width?: number }
+      | null
+    >;
     text?: string;
   } | null;
   metadata?: Record<string, unknown> | null;
@@ -85,6 +92,11 @@ const adapter: Adapter = {
       return [];
     }
 
+    // Determine export root dir for resolving attachment files
+    const pathStats = await stat(path).catch(() => null);
+    const exportDirPath = pathStats?.isFile() ? dirname(path) : path;
+    const fileIndex = await buildFileIndex(exportDirPath);
+
     const conversations: Conversation[] = [];
 
     for (const filePath of files) {
@@ -97,8 +109,8 @@ const adapter: Adapter = {
       }
 
       // Handle both array format (conversations.json) and single object format (ChatGPT-*.json)
-      const entries: RawConversation[] = Array.isArray(parsed) 
-        ? parsed 
+      const entries: RawConversation[] = Array.isArray(parsed)
+        ? parsed
         : [parsed as RawConversation];
 
       for (const entry of entries) {
@@ -107,7 +119,7 @@ const adapter: Adapter = {
           continue;
         }
 
-        const conv = parseConversation(entry, opts);
+        const conv = parseConversation(entry, opts, exportDirPath, fileIndex);
         if (!conv) {
           continue;
         }
@@ -161,8 +173,8 @@ function sortConversations(conversations: Conversation[]): Conversation[] {
   return conversations;
 }
 
-function parseConversation(entry: RawConversation, opts?: ParseOptions): Conversation | null {
-  const messages = extractMessages(entry.mapping);
+function parseConversation(entry: RawConversation, opts: ParseOptions | undefined, exportDirPath: string, fileIndex: Map<string, string>): Conversation | null {
+  const messages = extractMessages(entry.mapping, exportDirPath, fileIndex);
 
   if (messages.length === 0) {
     return null;
@@ -202,7 +214,7 @@ function parseConversation(entry: RawConversation, opts?: ParseOptions): Convers
   return conversation;
 }
 
-function extractMessages(mapping?: ConversationMap): Message[] {
+function extractMessages(mapping: ConversationMap | undefined, exportDirPath: string, fileIndex: Map<string, string>): Message[] {
   if (!mapping) return [];
 
   const messages: Message[] = [];
@@ -219,6 +231,10 @@ function extractMessages(mapping?: ConversationMap): Message[] {
     }
 
     const createdAt = msg.create_time ? Math.floor(msg.create_time * 1000) : undefined;
+    const metaAtts  = extractAttachments(msg.metadata, exportDirPath);
+    const partsAtts = extractPartsAttachments(msg.content?.parts, exportDirPath, fileIndex);
+    const execAtts  = extractExecutionOutputAttachments(msg, exportDirPath, fileIndex);
+    const attachments = metaAtts ?? partsAtts ?? execAtts ?? undefined;
 
     messages.push({
       role: mapRole(msg.author.role),
@@ -226,6 +242,7 @@ function extractMessages(mapping?: ConversationMap): Message[] {
       parts: textOnlyParts(content),
       createdAt,
       model: extractModel(msg.metadata),
+      attachments,
       metadata: {
         id: msg.id,
         nodeId: node.id,
@@ -286,6 +303,95 @@ function mapRole(role: string): Message['role'] {
     default:
       return 'assistant';
   }
+}
+
+function inferMimeType(filename: string): string | undefined {
+  const ext = filename.split('.').pop()?.toLowerCase();
+  const map: Record<string, string> = {
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+    gif: 'image/gif', webp: 'image/webp', heic: 'image/heic', heif: 'image/heif',
+    pdf: 'application/pdf', txt: 'text/plain', csv: 'text/csv',
+    json: 'application/json', xml: 'application/xml',
+    py: 'text/x-python', js: 'text/javascript', ts: 'text/typescript',
+    wav: 'audio/wav', mp3: 'audio/mpeg', mp4: 'video/mp4',
+    zip: 'application/zip',
+  };
+  return ext ? map[ext] : undefined;
+}
+
+async function buildFileIndex(exportDirPath: string): Promise<Map<string, string>> {
+  const entries = await readdir(exportDirPath).catch(() => [] as string[]);
+  const index = new Map<string, string>();
+  for (const name of entries) {
+    const match = name.match(/^(file-[A-Za-z0-9]+)-/);
+    if (match) index.set(match[1], name);
+  }
+  return index;
+}
+
+function extractAttachments(metadata: Record<string, unknown> | null | undefined, exportDirPath: string): Attachment[] | undefined {
+  const raw = metadata?.attachments;
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const atts: Attachment[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const a = item as Record<string, unknown>;
+    const name = typeof a.name === 'string' ? a.name : undefined;
+    const id   = typeof a.id   === 'string' ? a.id   : undefined;
+    if (!name) continue;
+    const mimeType = (typeof a.mime_type === 'string' ? a.mime_type : undefined) ?? inferMimeType(name);
+    const type: AttachmentType = mimeType?.startsWith('image/') ? 'image' : 'file';
+    const diskName = id ? `${id}-${name}` : name;
+    atts.push({ type, name, mimeType, path: join(exportDirPath, diskName) });
+  }
+  return atts.length > 0 ? atts : undefined;
+}
+
+function extractExecutionOutputAttachments(
+  msg: ConversationMessage,
+  exportDirPath: string,
+  fileIndex: Map<string, string>
+): Attachment[] | undefined {
+  if (msg.content?.content_type !== 'execution_output') return undefined;
+  const meta = msg.metadata as Record<string, unknown> | null | undefined;
+  const messages = (meta?.aggregate_result as Record<string, unknown> | undefined)?.jupyter_messages;
+  if (!Array.isArray(messages)) return undefined;
+
+  const atts: Attachment[] = [];
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') continue;
+    const data = ((m as Record<string, unknown>).content as Record<string, unknown> | undefined)?.data;
+    if (!data || typeof data !== 'object') continue;
+    const url = (data as Record<string, unknown>)['image/vnd.openai.fileservice.png'];
+    if (typeof url !== 'string') continue;
+    const fileId = url.replace('file-service://', '');
+    const diskName = fileIndex.get(fileId);
+    if (!diskName) continue;
+    atts.push({ type: 'image', name: diskName, mimeType: 'image/png', path: join(exportDirPath, diskName) });
+  }
+  return atts.length > 0 ? atts : undefined;
+}
+
+function extractPartsAttachments(
+  parts: ConversationMessage['content'] extends { parts?: infer P } ? P : never,
+  exportDirPath: string,
+  fileIndex: Map<string, string>
+): Attachment[] | undefined {
+  if (!Array.isArray(parts)) return undefined;
+  const atts: Attachment[] = [];
+  for (const part of parts) {
+    if (!part || typeof part !== 'object' || typeof part === 'string') continue;
+    const p = part as Record<string, unknown>;
+    if (p.content_type !== 'image_asset_pointer') continue;
+    const assetPointer = typeof p.asset_pointer === 'string' ? p.asset_pointer : undefined;
+    if (!assetPointer) continue;
+    const fileId = assetPointer.replace('file-service://', '');
+    const diskName = fileIndex.get(fileId);
+    if (!diskName) continue;
+    const mimeType = inferMimeType(diskName);
+    atts.push({ type: 'image', name: diskName, mimeType, path: join(exportDirPath, diskName) });
+  }
+  return atts.length > 0 ? atts : undefined;
 }
 
 function extractModel(metadata?: Record<string, unknown> | null): string | undefined {
